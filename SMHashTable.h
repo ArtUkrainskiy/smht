@@ -1,19 +1,6 @@
 #ifndef SMC_SMHASHTABLE_H
 #define SMC_SMHASHTABLE_H
 
-#include <cstring>
-#include <cstdlib>
-#include <string>
-#include <iostream>
-#include <memory>
-#include <chrono>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <algorithm>
-#include <map>
-#include <bitset>
 
 #define int_ceil_divide(x, y) ((x + y - 1) / y)
 
@@ -82,9 +69,13 @@ protected:
         void *linked_item{};
     };
 
+    struct service {
+        pthread_mutex_t memory_mutex;
+    };
+
     inline struct header *get_header(const char *key, uint32_t size);
 
-    inline void *find_memory_block(uint size, uint32_t offset = 0);
+    inline void *find_memory_block(size_t size, uint32_t offset = 0);
 
     static inline void reserve_memory_block(void *addr, uint32_t size);
 
@@ -101,12 +92,14 @@ private:
     size_t _data_block_size;
     uint32_t _memory_size;
 
+    size_t _service_size;
     size_t _header_size;
     size_t _header_len;
     size_t _data_len;
 
     std::string _name;
 
+    struct service *_service_ptr;
     void *_header_ptr;
     void *_memory_map_ptr;
     void *_data_ptr;
@@ -116,6 +109,10 @@ private:
     meminfo meminfo{};
 
     struct header *findParent(struct header *child);
+
+    int lock(pthread_mutex_t *mutex_ptr);
+
+    int unlock(pthread_mutex_t *mutex_ptr);
 };
 
 

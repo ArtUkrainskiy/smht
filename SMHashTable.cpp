@@ -1,28 +1,54 @@
-#include <unordered_map>
 #include <vector>
+#include <cstring>
+#include <iostream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+
 #include "SMHashTable.h"
 
 SMHashTable::SMHashTable(std::string name, int key_count, int data_count, int data_block_size) :
         _key_count(key_count), _data_count(data_count), _data_block_size(data_block_size), _name(std::move(name)) {
     // https://man7.org/linux/man-pages/man3/shm_open.3.html
+    bool created = false;
     _mem_descriptor = shm_open(_name.c_str(), O_RDWR, ALLPERMS);
     if (_mem_descriptor == -1) {
         _mem_descriptor = shm_open(_name.c_str(), O_RDWR | O_CREAT, ALLPERMS);
+        created = true;
     }
     //расчет объема памяти
+    _service_size = sizeof(pthread_mutex_t);
     _header_size = sizeof(struct header);
     _header_len = _header_size * key_count;
     _data_len = data_block_size * data_count;
     _memory_size = _header_len + data_count + _data_len;
     ftruncate(_mem_descriptor, _memory_size);
 
+    _service_ptr =  (struct service *)mmap(nullptr, _memory_size, PROT_READ | PROT_WRITE, MAP_SHARED, _mem_descriptor, 0);
     //Указатель на начало памяти, тут хранятся ключи хеш таблицы
-    _header_ptr = mmap(nullptr, _memory_size, PROT_READ | PROT_WRITE, MAP_SHARED, _mem_descriptor, 0);
+    _header_ptr = (char *) _service_ptr + _service_size;
     //карта распределения памяти
     _memory_map_ptr = (char *) _header_ptr + _header_len;
     //Сегмент с данными
     _data_ptr = (char *) _memory_map_ptr + data_count;
 
+    if(created){
+        auto *service = (struct service *)_service_ptr;
+        pthread_mutexattr_t attr;
+
+        if (pthread_mutexattr_init(&attr)) {
+            std::cerr << errno << std::endl;
+        }
+        if (pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)) {
+            std::cerr << errno << std::endl;
+        }
+        if (pthread_mutex_init(&service->memory_mutex, &attr)) {
+            std::cerr << errno << std::endl;
+        }
+    }
+    unlock(&_service_ptr->memory_mutex);
 }
 
 bool SMHashTable::set(const std::string &key, const std::string &val) {
@@ -31,7 +57,6 @@ bool SMHashTable::set(const std::string &key, const std::string &val) {
 
     //адрес в хеш таблице
     struct header *header = get_header(key.c_str(), key.size());
-
     if (!header->val_offset) {
         //место в хеш таблице свободно, пишем
         uint32_t need_memory_blocks = int_ceil_divide((val_size + key_size + sizeof(void *)), _data_block_size);
@@ -39,7 +64,6 @@ bool SMHashTable::set(const std::string &key, const std::string &val) {
         if (memory_block == nullptr) {
             return false;
         }
-        reserve_memory_block(memory_block, need_memory_blocks);
 
         void *data_dimension = (char *) _data_ptr + (((long) memory_block - (long) _memory_map_ptr) * _data_block_size);
         void *key_dimension = (void *) ((long) data_dimension + sizeof(void *));
@@ -81,7 +105,6 @@ bool SMHashTable::set(const std::string &key, const std::string &val) {
                 if (data_offset == nullptr) {
                     return false;
                 }
-                reserve_memory_block(data_offset, need_blocks_for_cur_data);
 
             }
             void *data_dimension =
@@ -106,7 +129,6 @@ bool SMHashTable::set(const std::string &key, const std::string &val) {
             if (header_memblock == nullptr) {
                 return false;
             }
-            reserve_memory_block(header_memblock, need_blocks_for_header);
 
             uint32_t need_memory_blocks = int_ceil_divide((val_size + key_size + sizeof(void *)), _data_block_size);
             void *memory_block = find_memory_block(need_memory_blocks);
@@ -115,8 +137,6 @@ bool SMHashTable::set(const std::string &key, const std::string &val) {
                 free_memory_block(header_memblock, need_blocks_for_header);
                 return false;
             }
-
-            reserve_memory_block(memory_block, need_memory_blocks);
 
             auto *new_header =
                     (struct header *) ((long) _data_ptr +
@@ -455,8 +475,14 @@ inline struct SMHashTable::header *SMHashTable::get_header(const char *key, uint
     return (struct header *) ((void *) ((char *) _header_ptr + (hash_method(key, size) % _key_count * _header_size)));
 }
 
-inline void *SMHashTable::find_memory_block(uint size, uint32_t offset) {
-    return find_zero_sequence((void *) ((long) _memory_map_ptr + offset), (void *) ((long) _memory_map_ptr + (long) _data_count), size);
+inline void *SMHashTable::find_memory_block(size_t size, uint32_t offset) {
+    lock(&_service_ptr->memory_mutex);
+    void *ptr = find_zero_sequence((void *) ((long) _memory_map_ptr + offset), (void *) ((long) _memory_map_ptr + (long) _data_count), size);
+    if(ptr){
+        std::memset(ptr, 1, size);
+    }
+    unlock(&_service_ptr->memory_mutex);
+    return ptr;
 }
 
 inline void SMHashTable::reserve_memory_block(void *addr, uint32_t size) {
@@ -485,4 +511,19 @@ void *SMHashTable::find_zero_sequence(void *from, void *to, uint32_t len) {
         }
     } while (len != counter);
     return nullptr;
+}
+
+int SMHashTable::lock(pthread_mutex_t *mutex_ptr){
+    int result = pthread_mutex_lock(mutex_ptr);
+    if (result == EOWNERDEAD) {
+        result = pthread_mutex_consistent(mutex_ptr);
+        if (result != 0){
+            perror("pthread_mutex_consistent");
+        }
+    }
+    return result;
+}
+
+int SMHashTable::unlock(pthread_mutex_t *mutex_ptr){
+    return pthread_mutex_unlock(mutex_ptr);
 }
